@@ -209,6 +209,8 @@ pub enum DaemonEvent {
     SetLcdBrightness {
         device_id: String,
         brightness: u8,
+        deadline: Instant,
+        reply: std::sync::mpsc::SyncSender<Result<bool, String>>,
     },
     StartPixelClean {
         device_id: Option<String>,
@@ -1042,18 +1044,25 @@ impl ServiceManager {
                 DaemonEvent::SetLcdBrightness {
                     device_id,
                     brightness,
+                    deadline,
+                    reply,
                 } => {
                     let mut targets = self.targets.lock();
-                    if let Some((_, target)) = targets
+                    let result = if Instant::now() >= deadline {
+                        Err("LCD brightness request expired".into())
+                    } else if let Some((_, target)) = targets
                         .iter_mut()
                         .find(|(_, t)| t.device_identity == device_id)
                     {
-                        target.apply_brightness(
+                        target.request_brightness(
                             Some(&self.wireless),
                             &mut self.packet_builder,
                             brightness,
-                        );
-                    }
+                        )
+                    } else {
+                        Err(format!("LCD not found: {device_id}"))
+                    };
+                    let _ = reply.try_send(result);
                 }
                 DaemonEvent::StartPixelClean {
                     device_id,

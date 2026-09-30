@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub(super) type SharedHidLcd = Arc<HidLcd>;
@@ -274,6 +274,7 @@ impl std::error::Error for LcdBusy {}
 
 /// How long a frame send waits for the LCD mutex before deferring.
 const LCD_BUSY_WAIT: Duration = Duration::from_millis(100);
+const BRIGHTNESS_WRITE_INTERVAL: Duration = Duration::from_millis(250);
 
 impl LcdBackend {
     pub(super) fn pause_for_wireless_image(&self) -> anyhow::Result<()> {
@@ -1038,10 +1039,10 @@ pub(crate) struct ActiveTarget {
     /// Set when the device definitively does not support recovery, so the
     /// periodic retry stops probing it.
     recovery_unsupported: bool,
-    /// Brightness that could not be applied because the init worker held
-    /// the LCD. Applied when init completes.
+    // Latest value waiting for initialization, the device lock, or HID write spacing.
     pending_brightness: Option<u8>,
     brightness_retries: u8,
+    next_brightness_attempt: Option<Instant>,
 }
 
 enum LcdInitialization {
@@ -1136,6 +1137,7 @@ impl ActiveTarget {
             recovery_unsupported: false,
             pending_brightness: None,
             brightness_retries: 0,
+            next_brightness_attempt: None,
         }
     }
 
@@ -1248,6 +1250,20 @@ impl ActiveTarget {
         self.flush_pending_brightness(wireless, builder);
     }
 
+    pub(super) fn request_brightness(
+        &mut self,
+        wireless: Option<&WirelessController>,
+        builder: &mut PacketBuilder,
+        brightness: u8,
+    ) -> Result<bool, String> {
+        if self.removal.is_some() {
+            return Err("LCD is being removed".into());
+        }
+        self.apply_brightness(wireless, builder, brightness);
+        // WinUSB acknowledges queue acceptance, not completion of the write.
+        Ok(self.pending_brightness.is_none() && !matches!(&self.lcd, LcdBackend::WinUsb(_)))
+    }
+
     pub(super) fn flush_pending_brightness(
         &mut self,
         wireless: Option<&WirelessController>,
@@ -1260,10 +1276,20 @@ impl ActiveTarget {
             return;
         };
         let result = if let LcdBackend::HidLcd(device) = &self.lcd {
-            let Some(guard) = device.try_lock() else {
+            if self
+                .next_brightness_attempt
+                .is_some_and(|next| Instant::now() < next)
+            {
+                return;
+            }
+            // Leave USB time for video and telemetry between slider writes.
+            self.next_brightness_attempt = Some(Instant::now() + BRIGHTNESS_WRITE_INTERVAL);
+            let Some(guard) = device.try_lock_for(LCD_BUSY_WAIT) else {
                 return;
             };
-            guard.set_brightness(brightness)
+            let result = guard.set_brightness(brightness);
+            self.next_brightness_attempt = Some(Instant::now() + BRIGHTNESS_WRITE_INTERVAL);
+            result
         } else {
             self.lcd.set_brightness(wireless, builder, brightness)
         };
@@ -3089,6 +3115,90 @@ mod tests {
 
     fn lcd(fail_on: usize) -> (SharedHidLcd, Arc<AtomicUsize>) {
         lcd_with_failures(fail_on, 1)
+    }
+
+    fn brightness_target() -> (ActiveTarget, SharedHidLcd, Arc<AtomicUsize>) {
+        let brightness = Arc::new(AtomicUsize::new(80));
+        let device = Arc::new(HidLcd::new(Box::new(TestLcd {
+            brightness: brightness.clone(),
+            sends: Arc::new(AtomicUsize::new(0)),
+            fail_on: 0,
+            fail_count: 0,
+        })));
+        let asset = Arc::new(MediaAsset {
+            kind: MediaAssetKind::Static {
+                frame: lianli_media::Retained::frame(vec![1]).unwrap(),
+            },
+            config_key: "brightness-test".into(),
+            stream_fps: 24.0,
+            hardware_video: false,
+        });
+        let target = ActiveTarget::new(
+            0,
+            "lcd".into(),
+            LcdBackend::HidLcd(device.clone()),
+            asset,
+            ScreenInfo::AIO_LCD_480,
+            false,
+            None,
+        );
+        (target, device, brightness)
+    }
+
+    #[test]
+    fn brightness_waits_for_an_in_flight_frame() {
+        let (mut target, device, brightness) = brightness_target();
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _guard = device.lock();
+            held_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        });
+        held_rx.recv().unwrap();
+        assert!(target
+            .request_brightness(None, &mut PacketBuilder::new(), 30)
+            .unwrap());
+        assert_eq!(brightness.load(Ordering::Relaxed), 30);
+        assert!(target.pending_brightness.is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn brightness_reports_deferred_and_rejects_removed_targets() {
+        let (mut target, device, brightness) = brightness_target();
+        let guard = device.lock();
+        assert!(!target
+            .request_brightness(None, &mut PacketBuilder::new(), 30)
+            .unwrap());
+        assert_eq!(brightness.load(Ordering::Relaxed), 80);
+        drop(guard);
+        thread::sleep(BRIGHTNESS_WRITE_INTERVAL);
+        target.flush_pending_brightness(None, &mut PacketBuilder::new());
+        assert_eq!(brightness.load(Ordering::Relaxed), 30);
+        target.request_removal();
+        assert!(target
+            .request_brightness(None, &mut PacketBuilder::new(), 80)
+            .is_err());
+        assert_eq!(brightness.load(Ordering::Relaxed), 30);
+    }
+
+    #[test]
+    fn brightness_bursts_keep_the_latest_value_and_leave_time_between_writes() {
+        let (mut target, _, brightness) = brightness_target();
+        let mut builder = PacketBuilder::new();
+        assert!(target.request_brightness(None, &mut builder, 10).unwrap());
+        for value in 11..=100 {
+            assert!(!target
+                .request_brightness(None, &mut builder, value)
+                .unwrap());
+        }
+        target.flush_pending_brightness(None, &mut builder);
+        assert_eq!(brightness.load(Ordering::Relaxed), 10);
+        assert_eq!(target.pending_brightness, Some(100));
+        thread::sleep(BRIGHTNESS_WRITE_INTERVAL);
+        target.flush_pending_brightness(None, &mut builder);
+        assert_eq!(brightness.load(Ordering::Relaxed), 100);
+        assert!(target.pending_brightness.is_none());
     }
 
     #[test]

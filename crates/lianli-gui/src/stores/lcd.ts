@@ -1,9 +1,10 @@
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
+import { computed, onScopeDispose, ref } from "vue";
 import { emit } from "@tauri-apps/api/event";
 import { useIpc } from "@/composables/useIpc";
 import { PIXEL_CLEANER_DURATION_OPTIONS } from "@/constants";
 import { useDebounce } from "@/composables/useDebounce";
+import { createBrightnessControl } from "@/utils/brightnessControl";
 import type { CatalogTemplate, LcdConfig, LcdTemplate, PixelCleanStatus } from "@/types";
 
 /** Broadcast when SetLcdTemplates changes the template list, so other open
@@ -64,6 +65,19 @@ function cleanerMatchesTarget(key: string, targetId?: string | null, cardIndex?:
  */
 export const useLcdStore = defineStore("lcd", () => {
   const ipc = useIpc();
+  const brightnessErrors = ref<Record<string, string>>({});
+  const brightnessControl = createBrightnessControl(
+    (deviceId, brightness) => ipc.request("SetLcdBrightness", { device_id: deviceId, brightness }),
+    (deviceId, error) => {
+      brightnessErrors.value[deviceId] =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Failed to set LCD brightness";
+    },
+  );
+  onScopeDispose(() => brightnessControl.dispose());
 
   // Last preview JPEG (base64) keyed by an arbitrary request id.
   const previewJpeg = ref<string>("");
@@ -90,7 +104,7 @@ export const useLcdStore = defineStore("lcd", () => {
     return ipc.request<CatalogInstallStatus | null>("GetCatalogInstallStatus");
   }
 
-  async function setBrightness(deviceId: string, brightness: number) {
+  function setBrightness(deviceId: string, brightness: number) {
     if (
       import.meta.env.DEV &&
       (deviceId.includes("mock") ||
@@ -98,7 +112,8 @@ export const useLcdStore = defineStore("lcd", () => {
     ) {
       return;
     }
-    await ipc.request("SetLcdBrightness", { device_id: deviceId, brightness });
+    delete brightnessErrors.value[deviceId];
+    brightnessControl.set(deviceId, brightness);
   }
 
   /**
@@ -332,6 +347,7 @@ export const useLcdStore = defineStore("lcd", () => {
     installTemplate,
     catalogInstallStatus,
     setBrightness,
+    brightnessErrors,
     renderPreview,
     startPixelClean,
     preparingCleaner,

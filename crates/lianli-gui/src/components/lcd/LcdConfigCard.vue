@@ -8,7 +8,7 @@ import { useDevicesStore } from "@/stores/devices";
 import { useLcdStore } from "@/stores/lcd";
 import { useIpc } from "@/composables/useIpc";
 import { useDebounce } from "@/composables/useDebounce";
-import { resolveLcdDevice } from "@/utils/lcdSelection";
+import { hasSavedLcdDevice, resolveLcdDevice } from "@/utils/lcdSelection";
 import { matchesMediaFile, pickMediaFile } from "@/utils/mediaPicker";
 import SensorGaugeEditor from "@/components/lcd/SensorGaugeEditor.vue";
 import ColorPicker from "@/components/rgb/ColorPicker.vue";
@@ -56,6 +56,9 @@ const selectedDeviceId = computed(
   () => deviceForEntry()?.device_id ?? "",
 );
 const selectedDevice = computed<DeviceInfo | undefined>(() => deviceForEntry());
+const brightnessConfigured = computed(() =>
+  hasSavedLcdDevice(selectedDeviceId.value, config.savedLcds, lcdDevices.value),
+);
 
 function onSelectDevice(id: string) {
   const d = lcdDevices.value.find((x) => x.device_id === id);
@@ -311,8 +314,8 @@ const brightness = computed({
   set: (v: number) => {
     props.entry.brightness = v;
     config.markDirty();
-    if (selectedDeviceId.value) {
-      void lcd.setBrightness(selectedDeviceId.value, v);
+    if (selectedDeviceId.value && brightnessConfigured.value) {
+      lcd.setBrightness(selectedDeviceId.value, v);
     }
   },
 });
@@ -540,6 +543,12 @@ async function handleStopClean() {
         suffix="%"
         @update:model-value="(v: number) => brightness = v"
       />
+      <n-alert v-if="lcd.brightnessErrors[selectedDeviceId]" type="error">
+        Could not change screen brightness: {{ lcd.brightnessErrors[selectedDeviceId] }}
+      </n-alert>
+      <p v-if="selectedDeviceId && !brightnessConfigured" class="hint">
+        Save this LCD configuration to apply brightness.
+      </p>
     </div>
     </div>
   </div>
