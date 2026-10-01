@@ -9,6 +9,7 @@ import { useLcdStore } from "@/stores/lcd";
 import { useIpc } from "@/composables/useIpc";
 import { useDebounce } from "@/composables/useDebounce";
 import { hasSavedLcdDevice, resolveLcdDevice } from "@/utils/lcdSelection";
+import { brightnessError } from "@/utils/brightnessControl";
 import { matchesMediaFile, pickMediaFile } from "@/utils/mediaPicker";
 import SensorGaugeEditor from "@/components/lcd/SensorGaugeEditor.vue";
 import ColorPicker from "@/components/rgb/ColorPicker.vue";
@@ -320,6 +321,12 @@ const brightness = computed({
   },
 });
 
+const currentBrightnessError = computed(() => brightnessError(
+  brightness.value,
+  devices.telemetry.lcd_brightness?.[selectedDeviceId.value],
+  lcd.brightnessErrors[selectedDeviceId.value],
+));
+
 const cleanerDurationOptions = PIXEL_CLEANER_DURATION_OPTIONS.map((opt) => ({
   label: opt.label,
   key: opt.value,
@@ -543,8 +550,8 @@ async function handleStopClean() {
         suffix="%"
         @update:model-value="(v: number) => brightness = v"
       />
-      <n-alert v-if="lcd.brightnessErrors[selectedDeviceId]" type="error">
-        Could not change screen brightness: {{ lcd.brightnessErrors[selectedDeviceId] }}
+      <n-alert v-if="currentBrightnessError" type="error">
+        Could not change screen brightness: {{ currentBrightnessError }}
       </n-alert>
       <p v-if="selectedDeviceId && !brightnessConfigured" class="hint">
         Save this LCD configuration to apply brightness.

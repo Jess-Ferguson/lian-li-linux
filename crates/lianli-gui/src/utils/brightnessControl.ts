@@ -1,3 +1,12 @@
+export function brightnessError(
+  value: number,
+  status: { brightness: number; pending: boolean; error: string | null } | undefined,
+  requestError?: string,
+): string | undefined {
+  if (status?.brightness === value) return status.error ?? undefined;
+  return requestError;
+}
+
 export function createBrightnessControl(
   send: (deviceId: string, value: number) => Promise<unknown>,
   onError: (deviceId: string, error: unknown) => void,

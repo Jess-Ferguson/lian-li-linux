@@ -1041,6 +1041,7 @@ pub(crate) struct ActiveTarget {
     recovery_unsupported: bool,
     // Latest value waiting for initialization, the device lock, or HID write spacing.
     pending_brightness: Option<u8>,
+    brightness_status: Option<lianli_shared::ipc::LcdBrightnessStatus>,
     brightness_retries: u8,
     next_brightness_attempt: Option<Instant>,
 }
@@ -1136,6 +1137,7 @@ impl ActiveTarget {
             initialization: LcdInitialization::Ready,
             recovery_unsupported: false,
             pending_brightness: None,
+            brightness_status: None,
             brightness_retries: 0,
             next_brightness_attempt: None,
         }
@@ -1246,6 +1248,11 @@ impl ActiveTarget {
             self.source_selection = Arc::new(());
         }
         self.pending_brightness = Some(brightness);
+        self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
+            brightness,
+            pending: true,
+            error: None,
+        });
         self.brightness_retries = 3;
         self.flush_pending_brightness(wireless, builder);
     }
@@ -1260,8 +1267,19 @@ impl ActiveTarget {
             return Err("LCD is being removed".into());
         }
         self.apply_brightness(wireless, builder, brightness);
+        if let Some(error) = self
+            .brightness_status
+            .as_ref()
+            .and_then(|status| status.error.as_ref())
+        {
+            return Err(error.clone());
+        }
         // WinUSB acknowledges queue acceptance, not completion of the write.
         Ok(self.pending_brightness.is_none() && !matches!(&self.lcd, LcdBackend::WinUsb(_)))
+    }
+
+    pub(super) fn brightness_status(&self) -> Option<&lianli_shared::ipc::LcdBrightnessStatus> {
+        self.brightness_status.as_ref()
     }
 
     pub(super) fn flush_pending_brightness(
@@ -1269,12 +1287,21 @@ impl ActiveTarget {
         wireless: Option<&WirelessController>,
         builder: &mut PacketBuilder,
     ) {
-        if !self.is_initialized() {
-            return;
-        }
         let Some(brightness) = self.pending_brightness else {
             return;
         };
+        if let LcdInitialization::Failed(error) = &self.initialization {
+            self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
+                brightness,
+                pending: false,
+                error: Some(format!("LCD initialization failed: {error}")),
+            });
+            self.pending_brightness = None;
+            return;
+        }
+        if !self.is_initialized() {
+            return;
+        }
         let result = if let LcdBackend::HidLcd(device) = &self.lcd {
             if self
                 .next_brightness_attempt
@@ -1294,7 +1321,14 @@ impl ActiveTarget {
             self.lcd.set_brightness(wireless, builder, brightness)
         };
         match result {
-            Ok(()) => self.pending_brightness = None,
+            Ok(()) => {
+                self.pending_brightness = None;
+                self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
+                    brightness,
+                    pending: false,
+                    error: None,
+                });
+            }
             Err(error) => {
                 self.brightness_retries = self.brightness_retries.saturating_sub(1);
                 if self.brightness_retries == 0 {
@@ -1304,6 +1338,11 @@ impl ActiveTarget {
                         self.index
                     );
                 }
+                self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
+                    brightness,
+                    pending: self.pending_brightness.is_some(),
+                    error: Some(format!("LCD brightness write failed: {error:#}")),
+                });
             }
         }
     }
@@ -1625,6 +1664,12 @@ impl ActiveTarget {
         self.media.request_stop();
         self.recovery_stop.store(true, Ordering::Relaxed);
         self.source_selection = Arc::new(());
+        if self.pending_brightness.is_some() {
+            if let Some(status) = &mut self.brightness_status {
+                status.pending = false;
+                status.error = Some("LCD removed before brightness delivery".into());
+            }
+        }
         self.pending_brightness = None;
         if let LcdBackend::WinUsb(sender) = &self.lcd {
             sender.stream_control.cancel();
@@ -3081,6 +3126,7 @@ mod tests {
 
     struct TestLcd {
         brightness: Arc<AtomicUsize>,
+        brightness_failures: AtomicUsize,
         sends: Arc<AtomicUsize>,
         fail_on: usize,
         fail_count: usize,
@@ -3094,6 +3140,12 @@ mod tests {
             Ok(())
         }
         fn set_brightness(&self, value: u8) -> anyhow::Result<()> {
+            let failure = self.brightness_failures.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            );
+            anyhow::ensure!(failure.is_err(), "injected brightness write failure");
             self.brightness.store(usize::from(value), Ordering::Relaxed);
             Ok(())
         }
@@ -3118,9 +3170,16 @@ mod tests {
     }
 
     fn brightness_target() -> (ActiveTarget, SharedHidLcd, Arc<AtomicUsize>) {
+        brightness_target_with_failures(0)
+    }
+
+    fn brightness_target_with_failures(
+        failures: usize,
+    ) -> (ActiveTarget, SharedHidLcd, Arc<AtomicUsize>) {
         let brightness = Arc::new(AtomicUsize::new(80));
         let device = Arc::new(HidLcd::new(Box::new(TestLcd {
             brightness: brightness.clone(),
+            brightness_failures: AtomicUsize::new(failures),
             sends: Arc::new(AtomicUsize::new(0)),
             fail_on: 0,
             fail_count: 0,
@@ -3161,6 +3220,88 @@ mod tests {
         assert_eq!(brightness.load(Ordering::Relaxed), 30);
         assert!(target.pending_brightness.is_none());
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn brightness_write_failure_reaches_requester_and_recovery_clears_it() {
+        let (mut target, _, brightness) = brightness_target_with_failures(1);
+        let mut builder = PacketBuilder::new();
+        assert!(target
+            .request_brightness(None, &mut builder, 30)
+            .unwrap_err()
+            .contains("injected brightness write failure"));
+        let status = target.brightness_status().unwrap();
+        assert_eq!(status.brightness, 30);
+        assert!(status.pending);
+        assert!(status.error.is_some());
+        assert_eq!(brightness.load(Ordering::Relaxed), 80);
+        thread::sleep(BRIGHTNESS_WRITE_INTERVAL);
+        target.flush_pending_brightness(None, &mut builder);
+        let status = target.brightness_status().unwrap();
+        assert!(!status.pending);
+        assert!(status.error.is_none());
+        assert_eq!(brightness.load(Ordering::Relaxed), 30);
+    }
+
+    #[test]
+    fn deferred_brightness_exhaustion_remains_visible_until_a_new_request() {
+        let (mut target, device, brightness) = brightness_target_with_failures(3);
+        let mut builder = PacketBuilder::new();
+        let guard = device.lock();
+        assert!(!target.request_brightness(None, &mut builder, 30).unwrap());
+        drop(guard);
+        for _ in 0..3 {
+            thread::sleep(BRIGHTNESS_WRITE_INTERVAL);
+            target.flush_pending_brightness(None, &mut builder);
+        }
+        let status = target.brightness_status().unwrap();
+        assert!(!status.pending);
+        assert!(status
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("injected brightness write failure"));
+        assert_eq!(brightness.load(Ordering::Relaxed), 80);
+        thread::sleep(BRIGHTNESS_WRITE_INTERVAL);
+        target.flush_pending_brightness(None, &mut builder);
+        assert!(target.brightness_status().unwrap().error.is_some());
+        assert!(target.request_brightness(None, &mut builder, 60).unwrap());
+        assert_eq!(brightness.load(Ordering::Relaxed), 60);
+        assert!(target.brightness_status().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn initialization_failure_ends_deferred_brightness_and_rejects_new_requests() {
+        let (mut target, _, brightness) = brightness_target();
+        let mut builder = PacketBuilder::new();
+        target.wait_for_initialization();
+        assert!(!target.request_brightness(None, &mut builder, 30).unwrap());
+        target.finish_initialization(Some("device disconnected"));
+        target.flush_pending_brightness(None, &mut builder);
+        let status = target.brightness_status().unwrap();
+        assert!(!status.pending);
+        assert!(status
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("device disconnected"));
+        assert!(target.request_brightness(None, &mut builder, 60).is_err());
+        assert_eq!(brightness.load(Ordering::Relaxed), 80);
+    }
+
+    #[test]
+    fn removal_ends_pending_brightness_with_an_error() {
+        let (mut target, device, brightness) = brightness_target();
+        let guard = device.lock();
+        assert!(!target
+            .request_brightness(None, &mut PacketBuilder::new(), 30)
+            .unwrap());
+        drop(guard);
+        target.request_removal();
+        let status = target.brightness_status().unwrap();
+        assert!(!status.pending);
+        assert!(status.error.as_ref().unwrap().contains("removed"));
+        assert_eq!(brightness.load(Ordering::Relaxed), 80);
     }
 
     #[test]
@@ -3206,6 +3347,7 @@ mod tests {
         let brightness = Arc::new(AtomicUsize::new(75));
         let device = Arc::new(HidLcd::new(Box::new(TestLcd {
             brightness: brightness.clone(),
+            brightness_failures: AtomicUsize::new(0),
             sends: Arc::new(AtomicUsize::new(0)),
             fail_on: 0,
             fail_count: 0,
@@ -3367,6 +3509,7 @@ mod tests {
         (
             Arc::new(HidLcd::new(Box::new(TestLcd {
                 brightness: Arc::new(AtomicUsize::new(100)),
+                brightness_failures: AtomicUsize::new(0),
                 sends: Arc::clone(&sends),
                 fail_on,
                 fail_count,
@@ -3381,6 +3524,7 @@ mod tests {
             let brightness = Arc::new(AtomicUsize::new(75));
             let device = Arc::new(HidLcd::new(Box::new(TestLcd {
                 brightness: brightness.clone(),
+                brightness_failures: AtomicUsize::new(0),
                 sends: Arc::new(AtomicUsize::new(0)),
                 fail_on: 0,
                 fail_count: 0,

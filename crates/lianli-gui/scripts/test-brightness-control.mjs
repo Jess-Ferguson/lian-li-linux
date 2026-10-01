@@ -5,7 +5,12 @@ import ts from "typescript";
 
 const source = await readFile(new URL("../src/utils/brightnessControl.ts", import.meta.url), "utf8");
 const javascript = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText;
-const { createBrightnessControl } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString("base64")}`);
+const { createBrightnessControl, brightnessError } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString("base64")}`);
+assert.equal(brightnessError(30, undefined, "LCD not found"), "LCD not found");
+assert.equal(brightnessError(30, { brightness: 30, pending: true, error: "USB write failed" }), "USB write failed");
+assert.equal(brightnessError(30, { brightness: 30, pending: false, error: "Retries exhausted" }), "Retries exhausted");
+assert.equal(brightnessError(30, { brightness: 30, pending: false, error: null }, "USB write failed"), undefined);
+assert.equal(brightnessError(80, { brightness: 30, pending: false, error: "Old failure" }), undefined);
 const sent = [];
 const errors = [];
 const releases = [];
