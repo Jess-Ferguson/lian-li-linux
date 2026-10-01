@@ -504,15 +504,20 @@ fn handle_request(
         IpcRequest::SetLcdBrightness {
             device_id,
             brightness,
+            request_id,
         } => {
             if brightness > 100 {
                 return IpcResponse::error("LCD brightness must be between 0 and 100");
+            }
+            if request_id.as_ref().is_some_and(|id| id.len() > 128) {
+                return IpcResponse::error("LCD brightness request ID is too long");
             }
             let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
             if tx
                 .send(DaemonEvent::SetLcdBrightness {
                     device_id,
                     brightness,
+                    request_id,
                     deadline: Instant::now() + Duration::from_secs(3),
                     reply: reply_tx,
                 })
@@ -840,6 +845,7 @@ mod tests {
             let worker = thread::spawn(move || {
                 let DaemonEvent::SetLcdBrightness {
                     brightness,
+                    request_id,
                     deadline,
                     reply,
                     ..
@@ -848,6 +854,7 @@ mod tests {
                     panic!("expected brightness request");
                 };
                 assert_eq!(brightness, 30);
+                assert_eq!(request_id.as_deref(), Some("test-brightness"));
                 assert!(deadline > Instant::now());
                 reply.send(result).unwrap();
             });
@@ -855,6 +862,7 @@ mod tests {
                 IpcRequest::SetLcdBrightness {
                     device_id: "lcd".into(),
                     brightness: 30,
+                    request_id: Some("test-brightness".into()),
                 },
                 &state,
                 tx.into(),
@@ -885,6 +893,20 @@ mod tests {
                 IpcRequest::SetLcdBrightness {
                     device_id: "lcd".into(),
                     brightness: 101,
+                    request_id: None,
+                },
+                &state,
+                tx.clone().into()
+            ),
+            IpcResponse::Error { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            handle_request(
+                IpcRequest::SetLcdBrightness {
+                    device_id: "lcd".into(),
+                    brightness: 30,
+                    request_id: Some("x".repeat(129)),
                 },
                 &state,
                 tx.clone().into()
@@ -898,6 +920,7 @@ mod tests {
                 IpcRequest::SetLcdBrightness {
                     device_id: "lcd".into(),
                     brightness: 30,
+                    request_id: None,
                 },
                 &state,
                 tx.into()

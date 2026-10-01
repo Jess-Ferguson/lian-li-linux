@@ -325,6 +325,7 @@ const currentBrightnessError = computed(() => brightnessError(
   brightness.value,
   devices.telemetry.lcd_brightness?.[selectedDeviceId.value],
   lcd.brightnessErrors[selectedDeviceId.value],
+  lcd.brightnessRequests[selectedDeviceId.value],
 ));
 
 const cleanerDurationOptions = PIXEL_CLEANER_DURATION_OPTIONS.map((opt) => ({

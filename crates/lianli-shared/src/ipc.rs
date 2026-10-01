@@ -217,6 +217,8 @@ pub enum IpcRequest {
     SetLcdBrightness {
         device_id: String,
         brightness: u8,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     PingDevice {
         device_id: String,
@@ -633,6 +635,8 @@ pub struct TelemetrySnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LcdBrightnessStatus {
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub brightness: u8,
     /// Waiting for driver submission, not confirmation from the panel.
     pub pending: bool,
@@ -650,6 +654,7 @@ mod quantity_tests {
         let snapshot: TelemetrySnapshot = serde_json::from_value(value).unwrap();
         assert!(snapshot.lcd_brightness.is_empty());
         let failure = LcdBrightnessStatus {
+            request_id: Some("brightness-request".into()),
             brightness: 30,
             pending: false,
             error: Some("USB write failed".into()),
@@ -658,9 +663,26 @@ mod quantity_tests {
         assert_eq!(
             encoded,
             serde_json::json!({
+                "request_id": "brightness-request",
                 "brightness": 30, "pending": false, "error": "USB write failed"
             })
         );
+        let request: IpcRequest = serde_json::from_value(serde_json::json!({
+            "method": "SetLcdBrightness", "params": { "device_id": "lcd", "brightness": 30 }
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            IpcRequest::SetLcdBrightness {
+                request_id: None,
+                ..
+            }
+        ));
+        let status: LcdBrightnessStatus = serde_json::from_value(serde_json::json!({
+            "brightness": 30, "pending": false, "error": null
+        }))
+        .unwrap();
+        assert!(status.request_id.is_none());
     }
 
     #[test]

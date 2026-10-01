@@ -1249,6 +1249,7 @@ impl ActiveTarget {
         }
         self.pending_brightness = Some(brightness);
         self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
+            request_id: None,
             brightness,
             pending: true,
             error: None,
@@ -1262,11 +1263,15 @@ impl ActiveTarget {
         wireless: Option<&WirelessController>,
         builder: &mut PacketBuilder,
         brightness: u8,
+        request_id: Option<String>,
     ) -> Result<bool, String> {
         if self.removal.is_some() {
             return Err("LCD is being removed".into());
         }
         self.apply_brightness(wireless, builder, brightness);
+        if let Some(status) = &mut self.brightness_status {
+            status.request_id = request_id;
+        }
         if let Some(error) = self
             .brightness_status
             .as_ref()
@@ -1282,6 +1287,19 @@ impl ActiveTarget {
         self.brightness_status.as_ref()
     }
 
+    fn update_brightness_status(&mut self, brightness: u8, pending: bool, error: Option<String>) {
+        let request_id = self
+            .brightness_status
+            .as_ref()
+            .and_then(|status| status.request_id.clone());
+        self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
+            request_id,
+            brightness,
+            pending,
+            error,
+        });
+    }
+
     pub(super) fn flush_pending_brightness(
         &mut self,
         wireless: Option<&WirelessController>,
@@ -1291,11 +1309,8 @@ impl ActiveTarget {
             return;
         };
         if let LcdInitialization::Failed(error) = &self.initialization {
-            self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
-                brightness,
-                pending: false,
-                error: Some(format!("LCD initialization failed: {error}")),
-            });
+            let error = format!("LCD initialization failed: {error}");
+            self.update_brightness_status(brightness, false, Some(error));
             self.pending_brightness = None;
             return;
         }
@@ -1323,11 +1338,7 @@ impl ActiveTarget {
         match result {
             Ok(()) => {
                 self.pending_brightness = None;
-                self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
-                    brightness,
-                    pending: false,
-                    error: None,
-                });
+                self.update_brightness_status(brightness, false, None);
             }
             Err(error) => {
                 self.brightness_retries = self.brightness_retries.saturating_sub(1);
@@ -1338,11 +1349,11 @@ impl ActiveTarget {
                         self.index
                     );
                 }
-                self.brightness_status = Some(lianli_shared::ipc::LcdBrightnessStatus {
+                self.update_brightness_status(
                     brightness,
-                    pending: self.pending_brightness.is_some(),
-                    error: Some(format!("LCD brightness write failed: {error:#}")),
-                });
+                    self.pending_brightness.is_some(),
+                    Some(format!("LCD brightness write failed: {error:#}")),
+                );
             }
         }
     }
@@ -3215,7 +3226,7 @@ mod tests {
         });
         held_rx.recv().unwrap();
         assert!(target
-            .request_brightness(None, &mut PacketBuilder::new(), 30)
+            .request_brightness(None, &mut PacketBuilder::new(), 30, None)
             .unwrap());
         assert_eq!(brightness.load(Ordering::Relaxed), 30);
         assert!(target.pending_brightness.is_none());
@@ -3227,12 +3238,13 @@ mod tests {
         let (mut target, _, brightness) = brightness_target_with_failures(1);
         let mut builder = PacketBuilder::new();
         assert!(target
-            .request_brightness(None, &mut builder, 30)
+            .request_brightness(None, &mut builder, 30, Some("failed-request".into()))
             .unwrap_err()
             .contains("injected brightness write failure"));
         let status = target.brightness_status().unwrap();
         assert_eq!(status.brightness, 30);
         assert!(status.pending);
+        assert_eq!(status.request_id.as_deref(), Some("failed-request"));
         assert!(status.error.is_some());
         assert_eq!(brightness.load(Ordering::Relaxed), 80);
         thread::sleep(BRIGHTNESS_WRITE_INTERVAL);
@@ -3240,6 +3252,7 @@ mod tests {
         let status = target.brightness_status().unwrap();
         assert!(!status.pending);
         assert!(status.error.is_none());
+        assert_eq!(status.request_id.as_deref(), Some("failed-request"));
         assert_eq!(brightness.load(Ordering::Relaxed), 30);
     }
 
@@ -3248,7 +3261,9 @@ mod tests {
         let (mut target, device, brightness) = brightness_target_with_failures(3);
         let mut builder = PacketBuilder::new();
         let guard = device.lock();
-        assert!(!target.request_brightness(None, &mut builder, 30).unwrap());
+        assert!(!target
+            .request_brightness(None, &mut builder, 30, Some("deferred-request".into()))
+            .unwrap());
         drop(guard);
         for _ in 0..3 {
             thread::sleep(BRIGHTNESS_WRITE_INTERVAL);
@@ -3256,6 +3271,7 @@ mod tests {
         }
         let status = target.brightness_status().unwrap();
         assert!(!status.pending);
+        assert_eq!(status.request_id.as_deref(), Some("deferred-request"));
         assert!(status
             .error
             .as_ref()
@@ -3265,9 +3281,15 @@ mod tests {
         thread::sleep(BRIGHTNESS_WRITE_INTERVAL);
         target.flush_pending_brightness(None, &mut builder);
         assert!(target.brightness_status().unwrap().error.is_some());
-        assert!(target.request_brightness(None, &mut builder, 60).unwrap());
+        assert!(target
+            .request_brightness(None, &mut builder, 60, Some("retry-request".into()))
+            .unwrap());
         assert_eq!(brightness.load(Ordering::Relaxed), 60);
         assert!(target.brightness_status().unwrap().error.is_none());
+        assert_eq!(
+            target.brightness_status().unwrap().request_id.as_deref(),
+            Some("retry-request")
+        );
     }
 
     #[test]
@@ -3275,7 +3297,9 @@ mod tests {
         let (mut target, _, brightness) = brightness_target();
         let mut builder = PacketBuilder::new();
         target.wait_for_initialization();
-        assert!(!target.request_brightness(None, &mut builder, 30).unwrap());
+        assert!(!target
+            .request_brightness(None, &mut builder, 30, None)
+            .unwrap());
         target.finish_initialization(Some("device disconnected"));
         target.flush_pending_brightness(None, &mut builder);
         let status = target.brightness_status().unwrap();
@@ -3285,7 +3309,9 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("device disconnected"));
-        assert!(target.request_brightness(None, &mut builder, 60).is_err());
+        assert!(target
+            .request_brightness(None, &mut builder, 60, None)
+            .is_err());
         assert_eq!(brightness.load(Ordering::Relaxed), 80);
     }
 
@@ -3294,7 +3320,7 @@ mod tests {
         let (mut target, device, brightness) = brightness_target();
         let guard = device.lock();
         assert!(!target
-            .request_brightness(None, &mut PacketBuilder::new(), 30)
+            .request_brightness(None, &mut PacketBuilder::new(), 30, None)
             .unwrap());
         drop(guard);
         target.request_removal();
@@ -3309,7 +3335,7 @@ mod tests {
         let (mut target, device, brightness) = brightness_target();
         let guard = device.lock();
         assert!(!target
-            .request_brightness(None, &mut PacketBuilder::new(), 30)
+            .request_brightness(None, &mut PacketBuilder::new(), 30, None)
             .unwrap());
         assert_eq!(brightness.load(Ordering::Relaxed), 80);
         drop(guard);
@@ -3318,7 +3344,7 @@ mod tests {
         assert_eq!(brightness.load(Ordering::Relaxed), 30);
         target.request_removal();
         assert!(target
-            .request_brightness(None, &mut PacketBuilder::new(), 80)
+            .request_brightness(None, &mut PacketBuilder::new(), 80, None)
             .is_err());
         assert_eq!(brightness.load(Ordering::Relaxed), 30);
     }
@@ -3327,10 +3353,12 @@ mod tests {
     fn brightness_bursts_keep_the_latest_value_and_leave_time_between_writes() {
         let (mut target, _, brightness) = brightness_target();
         let mut builder = PacketBuilder::new();
-        assert!(target.request_brightness(None, &mut builder, 10).unwrap());
+        assert!(target
+            .request_brightness(None, &mut builder, 10, None)
+            .unwrap());
         for value in 11..=100 {
             assert!(!target
-                .request_brightness(None, &mut builder, value)
+                .request_brightness(None, &mut builder, value, None)
                 .unwrap());
         }
         target.flush_pending_brightness(None, &mut builder);

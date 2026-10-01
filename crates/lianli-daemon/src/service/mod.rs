@@ -209,6 +209,7 @@ pub enum DaemonEvent {
     SetLcdBrightness {
         device_id: String,
         brightness: u8,
+        request_id: Option<String>,
         deadline: Instant,
         reply: std::sync::mpsc::SyncSender<Result<bool, String>>,
     },
@@ -1044,6 +1045,7 @@ impl ServiceManager {
                 DaemonEvent::SetLcdBrightness {
                     device_id,
                     brightness,
+                    request_id,
                     deadline,
                     reply,
                 } => {
@@ -1058,6 +1060,7 @@ impl ServiceManager {
                             Some(&self.wireless),
                             &mut self.packet_builder,
                             brightness,
+                            request_id,
                         )
                     } else {
                         Err(format!("LCD not found: {device_id}"))

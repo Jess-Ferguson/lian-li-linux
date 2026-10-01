@@ -1,10 +1,19 @@
+type BrightnessStatus = { request_id?: string | null; brightness: number; pending: boolean; error: string | null };
+
+export function brightnessConfirmed(status: BrightnessStatus | undefined, requestId?: string): boolean {
+  return !!requestId && status?.request_id === requestId && !status.pending && status.error === null;
+}
+
 export function brightnessError(
   value: number,
-  status: { brightness: number; pending: boolean; error: string | null } | undefined,
+  status: BrightnessStatus | undefined,
   requestError?: string,
+  requestId?: string,
 ): string | undefined {
-  if (status?.brightness === value) return status.error ?? undefined;
-  return requestError;
+  if (requestId && status?.request_id === requestId && status.brightness === value && !status.pending) {
+    return status.error ?? undefined;
+  }
+  return requestError ?? (status?.brightness === value ? status.error ?? undefined : undefined);
 }
 
 export function createBrightnessControl(
